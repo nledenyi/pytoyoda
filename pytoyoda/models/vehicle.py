@@ -706,6 +706,60 @@ class Vehicle(CustomAPIBaseModel[type[T]]):
         ret = next(iter(resp.payload.trips), None)
         return None if ret is None else Trip(ret, self._metric)
 
+    async def get_recent_trips(
+        self,
+        limit: int = 5,
+        with_route: bool = False,  # noqa: FBT001, FBT002
+        from_date: date | None = None,
+        to_date: date | None = None,
+    ) -> list[Trip]:
+        """Fetch the most recent N trips for this vehicle.
+
+        Independent of the cycle's pre-configured ``trip_history`` endpoint
+        (which stays at ``limit=1, route=False`` for backward compatibility);
+        this method exists so external callers (e.g. integrations that build
+        a per-trip viewer) can fetch larger batches with route waypoints
+        without changing the cycle's network behaviour.
+
+        Args:
+            limit: How many trips to return. 1..50 (Toyota API maximum).
+            with_route: If True, response includes per-trip route coordinates.
+                Adds significant payload size; opt-in.
+            from_date: Lower bound (inclusive). Defaults to today minus 90 days.
+            to_date: Upper bound (inclusive). Defaults to today.
+
+        Returns:
+            List of Trip models, ordered most-recent-first as returned by
+            Toyota's API. May be empty if the vehicle has no recorded trips
+            in the requested range.
+
+        Raises:
+            ValueError: If ``limit`` is outside the 1..50 range.
+
+        """
+        if not 1 <= limit <= 50:  # noqa: PLR2004
+            msg = f"limit must be between 1 and 50, got {limit}"
+            raise ValueError(msg)
+        if from_date is None:
+            from_date = date.today() - timedelta(days=90)  # noqa: DTZ011
+        if to_date is None:
+            to_date = date.today()  # noqa: DTZ011
+
+        resp = await self._api.get_trips(
+            self.vin,
+            from_date,
+            to_date,
+            summary=False,
+            limit=limit,
+            offset=0,
+            route=with_route,
+        )
+
+        if resp.payload is None:
+            return []
+
+        return [Trip(t, self._metric) for t in resp.payload.trips]
+
     async def refresh_climate_status(self) -> StatusModel:
         """Force update of climate status.
 
