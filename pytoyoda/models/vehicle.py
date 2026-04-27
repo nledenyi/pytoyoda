@@ -755,7 +755,7 @@ class Vehicle(CustomAPIBaseModel[type[T]]):
             route=with_route,
         )
 
-        if resp.payload is None:
+        if resp.payload is None or not resp.payload.trips:
             return []
 
         return [Trip(t, self._metric) for t in resp.payload.trips]

@@ -137,6 +137,27 @@ async def test_empty_payload_returns_empty_list():
 
 
 @pytest.mark.asyncio
+async def test_payload_with_none_trips_returns_empty_list():
+    """Toyota has been observed returning payloads where trips is None
+    (separate from payload itself being None). Defensive check ensures
+    we don't crash trying to iterate None."""
+    async def fake_get_trips(*_a, **_kw):
+        return SimpleNamespace(payload=SimpleNamespace(trips=None))
+
+    api = MagicMock()
+    api.get_trips = AsyncMock(side_effect=fake_get_trips)
+
+    v = Vehicle.__new__(Vehicle)
+    v._api = api
+    v._vehicle_info = SimpleNamespace(vin="VINX", nickname="X")
+    v._metric = True
+    v._endpoint_data = {}
+
+    result = await v.get_recent_trips()
+    assert result == []
+
+
+@pytest.mark.asyncio
 async def test_zero_trips_returns_empty_list():
     v = _make_vehicle_with_mock_api(_payload_with_trips(0))
     result = await v.get_recent_trips(limit=5)
