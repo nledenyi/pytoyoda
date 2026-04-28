@@ -86,6 +86,16 @@ class EndpointDefinition:
     name: str
     capable: bool
     function: Callable
+    # When True, a failure on this endpoint during update() is caught,
+    # logged, and recorded in Vehicle._endpoint_errors instead of
+    # propagating. The remaining endpoints continue to fetch normally.
+    # Use for endpoints whose failure should not bring down the whole
+    # vehicle's update cycle - typically feature endpoints (climate,
+    # trips history) where Toyota's gateway is known to occasionally
+    # 500 with account-specific responses unrelated to the rest of the
+    # data. See https://github.com/pytoyoda/ha_toyota/issues/291 for
+    # the motivating case.
+    optional: bool = False
 
 
 class Vehicle(CustomAPIBaseModel[type[T]]):
@@ -200,6 +210,17 @@ class Vehicle(CustomAPIBaseModel[type[T]]):
                     function=partial(
                         self._api.get_climate_settings, vin=self._vehicle_info.vin
                     ),
+                    # Toyota's gateway is observed to return persistent 500s
+                    # on /v1/global/remote/climate-settings for some accounts
+                    # whose vehicles do support remote climate per the
+                    # high-level features flag (e.g. ha_toyota#291: a
+                    # Corolla HB/TS '23 with `features.climate_start_engine:
+                    # True` but every `remote_service_capabilities.*` flag
+                    # False, returning HTTP 500 + ONE-GLOBAL-RS-40000). A
+                    # failure here should not bring down the rest of the
+                    # vehicle's data; the integration can render the
+                    # climate entity unavailable and keep going.
+                    optional=True,
                 ),
                 EndpointDefinition(
                     name="climate_status",
@@ -211,6 +232,9 @@ class Vehicle(CustomAPIBaseModel[type[T]]):
                     function=partial(
                         self._api.get_climate_status, vin=self._vehicle_info.vin
                     ),
+                    # Mirrors climate_settings: optional so a failure on the
+                    # climate sub-system doesn't abort the whole update cycle.
+                    optional=True,
                 ),
                 EndpointDefinition(
                     name="trip_history",
@@ -235,10 +259,16 @@ class Vehicle(CustomAPIBaseModel[type[T]]):
                 )
             )
         self._endpoint_collect = [
-            (endpoint.name, endpoint.function)
+            (endpoint.name, endpoint.function, endpoint.optional)
             for endpoint in self._api_endpoints
             if endpoint.capable
         ]
+        # Per-endpoint exceptions captured during the most recent update().
+        # Populated for endpoints declared `optional=True` whose call
+        # raised; consumers can inspect this map to decide which derived
+        # data should render as unavailable without losing the rest of the
+        # cycle's data.
+        self._endpoint_errors: dict[str, Exception] = {}
 
     async def update(
         self,
@@ -280,12 +310,31 @@ class Vehicle(CustomAPIBaseModel[type[T]]):
             raise ValueError(msg)
         skip_set = set(skip or [])
         only_set = set(only) if only is not None else None
-        for name, function in self._endpoint_collect:
+        # Reset per-cycle error map. Endpoints that succeeded leave a clean
+        # slate; endpoints that failed populate _endpoint_errors[name].
+        self._endpoint_errors = {}
+        for name, function, optional in self._endpoint_collect:
             if only_set is not None and name not in only_set:
                 continue
             if name in skip_set:
                 continue
-            self._endpoint_data[name] = await function()
+            try:
+                self._endpoint_data[name] = await function()
+            except Exception as ex:
+                if not optional:
+                    # Required endpoint - propagate as before. Caller still
+                    # gets fail-fast semantics for the core data path.
+                    raise
+                # Optional endpoint - record the failure, log it, and let
+                # the loop continue. Successful endpoints are unaffected.
+                self._endpoint_errors[name] = ex
+                logger.warning(
+                    "Optional endpoint '{}' failed and will be skipped this "
+                    "cycle: {}: {}",
+                    name,
+                    type(ex).__name__,
+                    ex,
+                )
 
     @computed_field  # type: ignore[prop-decorator]
     @property
