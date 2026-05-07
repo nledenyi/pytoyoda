@@ -249,6 +249,14 @@ class Vehicle(CustomAPIBaseModel[type[T]]):
                         offset=0,
                         route=False,
                     ),
+                    # Trip history is consulted as a free piggyback signal by
+                    # ha_toyota's RecentTripsManager (gates whether to fire the
+                    # heavier with_route fetch). A 500/429 here should not
+                    # cascade into aborting the whole cycle - status/telemetry
+                    # are far more important. Stale-but-known trip_history is
+                    # an acceptable fallback; the manager re-evaluates next
+                    # cycle.
+                    optional=True,
                 ),
             ]
         else:
