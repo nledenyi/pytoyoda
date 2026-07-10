@@ -28,7 +28,6 @@ from typing import Any
 
 import jwt as pyjwt
 
-
 CERTS_DIR = Path(__file__).resolve().parent / "certs"
 CERT_PATH = CERTS_DIR / "cert.pem"
 KEY_PATH = CERTS_DIR / "key.pem"
@@ -117,10 +116,11 @@ _BODIES_CACHE: dict[str, Any] | None = None
 # ---------------------------------------------------------------------------
 # Per-VIN cache-expiry simulator (for smart-strategy TDD, 2026-04-25+).
 #
-# Models the Toyota two-stage protocol we discovered on 2026-04-24:
-#   - GET  /v1/global/remote/status         reads the cache (429+APIGW-403 if cold/stale)
-#   - POST /v1/global/remote/refresh-status wakes the car (200/returnCode 000000),
-#                                            cache populates if the car responds
+# Models the Toyota two-stage protocol we discovered on 2026-04-24 (endpoints
+# migrated 2026-07 off the retired /v1/global/remote/* family):
+#   - GET  /v1/vehicle/status  reads the cache (429+APIGW-403 if cold/stale)
+#   - POST /v1/remote/status   wakes the car (200/returnCode 000000),
+#                              cache populates if the car responds
 #
 # Simulator invariants (per VIN):
 #   - cache_populated_at: when the cache was last refreshed by a successful POST
@@ -224,24 +224,6 @@ class _Registry:
 SIM = _Registry()
 
 
-def _vin_from_path_or_body(path: str, body_bytes: bytes | None) -> str:
-    """Resolve the VIN this request targets.
-
-    /status: VIN comes from the X-VIN header (handled separately - we cannot get
-    headers here). Fallback to a default 'DEFAULT' VIN if nothing else.
-
-    /refresh-status: VIN is in the JSON body.
-    """
-    if body_bytes:
-        try:
-            data = json.loads(body_bytes)
-            if isinstance(data, dict) and "vin" in data:
-                return str(data["vin"])
-        except (json.JSONDecodeError, ValueError):
-            pass
-    return "DEFAULT"
-
-
 _APIGW_403_BODY = json.dumps({"code": "APIGW-403", "message": "Unauthorized"}).encode()
 
 
@@ -249,12 +231,13 @@ def _build_status_response(sim: VehicleSim) -> bytes:
     """Render the /status fixture body but with the simulator's occurrence_date.
 
     We deep-copy lazily by re-loading the JSON each call (cheap; happens only on
-    cache-fresh hits) so we don't mutate _BODIES_CACHE."""
+    cache-fresh hits) so we don't mutate _BODIES_CACHE.
+    """
     raw = _load_real_or(
         "get_v1_global_remote_status.json", "v1_global_remote_status.json"
     )
     payload = raw.get("payload") or {}
-    payload["occurrenceDate"] = sim.occurrence_date()
+    payload["lastUpdateTimestamp"] = sim.occurrence_date()
     raw["payload"] = payload
     return json.dumps(raw).encode()
 
@@ -288,9 +271,10 @@ def _route(
         return 200, {"Content-Type": "application/json"}, json.dumps(b["tokens"]).encode()
 
     # --- Smart-strategy endpoints (simulator-backed) ---
-    # POST /v1/global/remote/refresh-status (must precede /status check below)
-    if method == "POST" and "/v1/global/remote/refresh-status" in base_path:
-        vin = _vin_from_path_or_body(path, body_bytes)
+    # POST /v1/remote/status wake (migrated from /v1/global/remote/refresh-status,
+    # now SigV4-fenced). VIN travels in the header now, not a JSON body.
+    if method == "POST" and "/v1/remote/status" in base_path:
+        vin = headers.get("vin") or headers.get("VIN") or "DEFAULT"
         sim = SIM.get(vin)
         now = time.monotonic()
         sim.last_post_at = now
@@ -320,8 +304,9 @@ def _route(
             ).encode(),
         )
 
-    # GET /v1/global/remote/status (cache-expiry semantics)
-    if method == "GET" and "/v1/global/remote/status" in base_path:
+    # GET /v1/vehicle/status (cache-expiry semantics; migrated from
+    # /v1/global/remote/status which Toyota retired behind SigV4)
+    if method == "GET" and "/v1/vehicle/status" in base_path:
         vin = headers.get("vin") or headers.get("VIN") or "DEFAULT"
         sim = SIM.get(vin)
         sim.get_call_count += 1
@@ -355,7 +340,7 @@ def _route(
 class _Handler(BaseHTTPRequestHandler):
     """Minimal handler that silences default logging and dispatches on path."""
 
-    def log_message(self, fmt: str, *args: Any) -> None:  # noqa: A003
+    def log_message(self, fmt: str, *args: Any) -> None:
         # Silent by default; stdlib http.server is very noisy otherwise.
         pass
 
@@ -372,13 +357,13 @@ class _Handler(BaseHTTPRequestHandler):
     def _request_headers(self) -> dict[str, str]:
         return {k: v for k, v in self.headers.items()}
 
-    def do_GET(self) -> None:  # noqa: N802
+    def do_GET(self) -> None:
         status, headers, body = _route(
             "GET", self.path, headers=self._request_headers(), body_bytes=None
         )
         self._send(status, headers, body)
 
-    def do_POST(self) -> None:  # noqa: N802
+    def do_POST(self) -> None:
         length = int(self.headers.get("Content-Length", "0") or "0")
         body_bytes = self.rfile.read(length) if length > 0 else b""
         status, headers, body = _route(
@@ -437,5 +422,5 @@ class HarnessServer:
         self.start()
         return self
 
-    def __exit__(self, *exc_info: Any) -> None:
+    def __exit__(self, *exc_info: object) -> None:
         self.stop()
